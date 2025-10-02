@@ -70,8 +70,27 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
-# Load YOLO once
-model = YOLO(MODEL_PATH)
+# Download and load YOLO model
+def download_model():
+    model_url = os.getenv('MODEL_URL')
+    if not model_url:
+        raise ValueError("MODEL_URL not found in environment variables")
+    
+    # Create models directory if it doesn't exist
+    os.makedirs('models', exist_ok=True)
+    local_path = 'models/best.pt'
+    
+    if not os.path.exists(local_path):
+        print(f"Downloading model from {model_url}")
+        import requests
+        response = requests.get(model_url)
+        with open(local_path, 'wb') as f:
+            f.write(response.content)
+    
+    return local_path
+
+model_path = download_model()
+model = YOLO(model_path)
 
 # ------------------- HELPERS -------------------
 def run_ocr_on_crop(crop, save_name=None):
