@@ -10,6 +10,7 @@ import os
 import cv2
 import numpy as np
 import pytesseract
+import requests
 from ultralytics import YOLO
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,18 +50,16 @@ OUTPUT_DIR = "cropped_plates"
 DEBUG_DIR = "debug_preprocessed"
 ANNOTATED_DIR = "annotated"
 
-MODEL_PATH = "best.pt"   # your YOLO weights
-
-# Create dir
+# Create dirs
 for d in [UPLOAD_DIR, OUTPUT_DIR, DEBUG_DIR, ANNOTATED_DIR]:
     os.makedirs(d, exist_ok=True)
 
-# Configure Tesseract (Windows users may need to adjust path)
-TESSERACT_CMD = os.getenv("TESSERACT_CMD") or r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+# Configure Tesseract (Linux default path for Render)
+TESSERACT_CMD = os.getenv("TESSERACT_CMD") or "/usr/bin/tesseract"
 if os.path.exists(TESSERACT_CMD):
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
-# Supabase credentials (from .env)
+# Supabase credentials
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 BUCKET_NAME = os.getenv("BUCKET_NAME", "violations")
@@ -70,22 +69,24 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
-# Download and load YOLO model
+# ------------------- MODEL DOWNLOAD -------------------
 def download_model():
-    model_url = os.getenv('MODEL_URL')
+    """Download YOLO model (best.pt) from Supabase Storage if not present locally"""
+    model_url = os.getenv("MODEL_URL")  # Public URL of best.pt in Supabase
     if not model_url:
         raise ValueError("MODEL_URL not found in environment variables")
     
-    # Create models directory if it doesn't exist
-    os.makedirs('models', exist_ok=True)
-    local_path = 'models/best.pt'
+    os.makedirs("models", exist_ok=True)
+    local_path = "models/best.pt"
     
     if not os.path.exists(local_path):
-        print(f"Downloading model from {model_url}")
-        import requests
-        response = requests.get(model_url)
-        with open(local_path, 'wb') as f:
-            f.write(response.content)
+        print(f"[INFO] Downloading YOLO model from {model_url} ...")
+        r = requests.get(model_url)
+        if r.status_code != 200:
+            raise RuntimeError(f"Failed to download model: HTTP {r.status_code}")
+        with open(local_path, "wb") as f:
+            f.write(r.content)
+        print("[INFO] Model download complete.")
     
     return local_path
 
@@ -110,7 +111,7 @@ def run_ocr_on_crop(crop, save_name=None):
         plate_text = ''.join(c for c in text if c.isalnum())
         return plate_text if plate_text else None
     except Exception as e:
-        print(f"OCR error: {e}")
+        print(f"[ERROR] OCR error: {e}")
         return None
 
 
@@ -155,17 +156,16 @@ def insert_plate_record(camera_id, plate_text, confidence, plate_url, scene_url)
         print(f"[ERROR] Supabase insert exception: {e}")
         return False
 
-
 # ------------------- FLASK ROUTE -------------------
 @app.route("/upload", methods=["POST"])
 def upload_image():
     try:
-        # Get camera_id from form data or headers
+        # Get camera_id
         camera_id = request.form.get("camera_id") or request.headers.get("X-Camera-ID", "CAM1")
         
-        # Get image data from form or raw data
-        if 'image' in request.files:
-            img_file = request.files['image']
+        # Get image
+        if "image" in request.files:
+            img_file = request.files["image"]
             img_bytes = img_file.read()
         else:
             img_bytes = request.data
@@ -191,7 +191,6 @@ def upload_image():
             if not hasattr(r, "boxes") or r.boxes is None:
                 continue
 
-            img_h, img_w = img.shape[:2]
             boxes = r.boxes.xyxy.cpu().numpy()
             class_ids = r.boxes.cls.cpu().numpy().astype(int)
             confs = r.boxes.conf.cpu().numpy()
@@ -203,12 +202,11 @@ def upload_image():
                 if x2 <= x1 or y2 <= y1:
                     continue
 
-                # Only process plates
                 class_name = model.names[class_ids[i]] if hasattr(model, "names") else str(class_ids[i])
                 if class_name.lower() != "plate":
                     continue
 
-                # Draw bounding box
+                # Draw box
                 cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 cv2.putText(annotated, f"{class_name} {confidence:.2f}", (x1, y1 - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
@@ -223,7 +221,6 @@ def upload_image():
                 plate_text = run_ocr_on_crop(crop, crop_name)
                 print(f"[OCR] {crop_name} → {plate_text} (conf {confidence:.2f})")
 
-                # Upload cropped plate
                 plate_url = upload_to_supabase_storage(crop_path, camera_id)
 
                 detected_plates.append({
@@ -233,7 +230,7 @@ def upload_image():
                     "confidence": confidence
                 })
 
-        # Save and upload annotated scene image
+        # Save annotated scene
         ann_name = f"{os.path.splitext(filename)[0]}_ann.jpg"
         ann_path = os.path.join(ANNOTATED_DIR, ann_name)
         cv2.imwrite(ann_path, annotated)
@@ -241,13 +238,7 @@ def upload_image():
 
         # Insert into DB
         for dp in detected_plates:
-            insert_plate_record(
-                camera_id,
-                dp["text"],
-                dp["confidence"],
-                dp.get("plate_url"),
-                scene_url
-            )
+            insert_plate_record(camera_id, dp["text"], dp["confidence"], dp.get("plate_url"), scene_url)
 
         return jsonify({
             "status": "ok",
