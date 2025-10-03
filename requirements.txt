@@ -1,7 +1,8 @@
 flask
 ultralytics
-opencv-python
-numpy
+opencv-python-headless
 pytesseract
-supabase
 python-dotenv
+supabase
+requests
+gunicorn
