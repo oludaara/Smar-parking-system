@@ -1,17 +1,12 @@
 # server.py
-# Flask server for ESP32 uploads:
-# - Receives image
-# - Runs YOLOv8 detection
-# - Crops plate + runs OCR
-# - Uploads annotated + cropped plates to Supabase
-# - Validates against registered_vehicles DB
-# - Inserts violation record with offense type + alert
+# Optimized Flask + YOLOv8 + OCR server for low-memory environments (Render free tier)
 
 import os
 import cv2
 import numpy as np
 import pytesseract
 import requests
+import torch
 from ultralytics import YOLO
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,7 +16,10 @@ import mimetypes
 from dotenv import load_dotenv
 load_dotenv()
 
-# Initialize Flask app
+# ------------------- OPTIMIZATIONS -------------------
+torch.set_grad_enabled(False)  # Disable autograd globally (saves memory)
+
+# ------------------- FLASK APP -------------------
 app = Flask(__name__)
 
 # ------------------- ROUTES -------------------
@@ -29,11 +27,7 @@ app = Flask(__name__)
 def index():
     return jsonify({
         "status": "ok",
-        "message": "Smart Parking System Server is running",
-        "endpoints": {
-            "POST /upload": "Upload an image for processing",
-            "GET /test": "Test server connectivity"
-        }
+        "message": "Smart Parking System Server is running"
     })
 
 @app.route("/test", methods=["GET"])
@@ -45,47 +39,42 @@ UPLOAD_DIR = "uploads"
 OUTPUT_DIR = "cropped_plates"
 DEBUG_DIR = "debug_preprocessed"
 ANNOTATED_DIR = "annotated"
-
 for d in [UPLOAD_DIR, OUTPUT_DIR, DEBUG_DIR, ANNOTATED_DIR]:
     os.makedirs(d, exist_ok=True)
 
-# Configure Tesseract
 TESSERACT_CMD = os.getenv("TESSERACT_CMD") or "/usr/bin/tesseract"
 if os.path.exists(TESSERACT_CMD):
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
-# Supabase credentials
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 BUCKET_NAME = os.getenv("BUCKET_NAME", "violations")
-
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-    raise RuntimeError("Supabase credentials missing. Please set SUPABASE_URL and SUPABASE_SERVICE_KEY.")
+    raise RuntimeError("Missing Supabase credentials")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
-# ------------------- MODEL DOWNLOAD -------------------
+# ------------------- MODEL -------------------
 def download_model():
+    """Download YOLO model (best.pt) from Supabase if not present"""
     model_url = os.getenv("MODEL_URL")
     if not model_url:
-        raise ValueError("MODEL_URL not found in environment variables")
-    
+        raise ValueError("MODEL_URL not found in env vars")
+
     os.makedirs("models", exist_ok=True)
     local_path = "models/best.pt"
-    
     if not os.path.exists(local_path):
         print(f"[INFO] Downloading YOLO model from {model_url} ...")
         r = requests.get(model_url)
-        if r.status_code != 200:
-            raise RuntimeError(f"Failed to download model: HTTP {r.status_code}")
+        r.raise_for_status()
         with open(local_path, "wb") as f:
             f.write(r.content)
         print("[INFO] Model download complete.")
-    
     return local_path
 
 model_path = download_model()
 model = YOLO(model_path)
+model.fuse()  # fuse Conv+BN layers → less memory
 
 # ------------------- HELPERS -------------------
 def run_ocr_on_crop(crop, save_name=None):
@@ -93,7 +82,6 @@ def run_ocr_on_crop(crop, save_name=None):
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
         gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
         gray = cv2.medianBlur(gray, 3)
-
         if save_name:
             cv2.imwrite(os.path.join(DEBUG_DIR, save_name), gray)
 
@@ -107,7 +95,6 @@ def run_ocr_on_crop(crop, save_name=None):
         print(f"[ERROR] OCR error: {e}")
         return None
 
-
 def upload_to_supabase_storage(local_path, public_folder=""):
     try:
         with open(local_path, "rb") as f:
@@ -117,60 +104,41 @@ def upload_to_supabase_storage(local_path, public_folder=""):
         if not content_type:
             content_type = "image/jpeg"
 
-        supabase.storage.from_(BUCKET_NAME).upload(file_key, data, {"content-type": content_type}, upsert=True)
-        public_url = supabase.storage.from_(BUCKET_NAME).get_public_url(file_key)
-        if isinstance(public_url, dict):
-            return public_url.get("publicURL") or public_url.get("public_url")
-        return public_url
+        supabase.storage.from_(BUCKET_NAME).upload(
+            file_key, data, {"content-type": content_type}, upsert=True
+        )
+        return supabase.storage.from_(BUCKET_NAME).get_public_url(file_key)
     except Exception as e:
         print(f"[ERROR] Supabase upload failed: {e}")
         return None
 
-
 def insert_plate_record(camera_id, plate_text, confidence, plate_url, scene_url):
-    """Check plate validity, decide offense, insert into DB, return alert msg."""
     try:
-        norm_plate = (plate_text or "").upper().strip()
-
-        # Validate against registered_vehicles
-        res = supabase.table("registered_vehicles").select("plate_text").eq("plate_text", norm_plate).execute()
-        registered = len(res.data) > 0
-
-        if registered:
-            offense = "Parking Violation"
-            alert_msg = f"Wrong parking detected by Camera: {camera_id}"
-        else:
-            offense = "Unregistered Vehicle + Parking Violation"
-            alert_msg = "Invalid Plate Number or Unregistered Vehicle. Committed double offence"
-
         row = {
             "camera_id": camera_id,
-            "plate_text": norm_plate,
+            "plate_text": plate_text,
             "confidence": confidence,
             "plate_url": plate_url,
             "scene_url": scene_url,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "offense_type": offense,
             "status": "new",
         }
         supabase.table("violations").insert(row).execute()
-        return alert_msg
+        return True
     except Exception as e:
         print(f"[ERROR] Supabase insert exception: {e}")
-        return None
+        return False
 
 # ------------------- FLASK ROUTE -------------------
 @app.route("/upload", methods=["POST"])
 def upload_image():
     try:
         camera_id = request.form.get("camera_id") or request.headers.get("X-Camera-ID", "CAM1")
-        
+
         if "image" in request.files:
-            img_file = request.files["image"]
-            img_bytes = img_file.read()
+            img_bytes = request.files["image"].read()
         else:
             img_bytes = request.data
-            
         if not img_bytes:
             return jsonify({"error": "No image data received"}), 400
 
@@ -183,7 +151,8 @@ def upload_image():
         save_path = os.path.join(UPLOAD_DIR, filename)
         cv2.imwrite(save_path, img)
 
-        results = model.predict(img, conf=0.5, imgsz=640, verbose=False)
+        # Run YOLO detection with smaller imgsz to save memory
+        results = model.predict(img, conf=0.5, imgsz=320, device="cpu", verbose=False)
         annotated = img.copy()
         detected_plates = []
 
@@ -198,7 +167,6 @@ def upload_image():
             for i, box in enumerate(boxes):
                 x1, y1, x2, y2 = map(int, box[:4])
                 confidence = float(confs[i])
-
                 if x2 <= x1 or y2 <= y1:
                     continue
 
@@ -206,30 +174,28 @@ def upload_image():
                 if class_name.lower() != "plate":
                     continue
 
+                # Draw box
                 cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 cv2.putText(annotated, f"{class_name} {confidence:.2f}", (x1, y1 - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
+                # Crop plate
                 crop = img[y1:y2, x1:x2]
                 crop_name = f"{os.path.splitext(filename)[0]}_plate_{i}.jpg"
                 crop_path = os.path.join(OUTPUT_DIR, crop_name)
                 cv2.imwrite(crop_path, crop)
 
                 plate_text = run_ocr_on_crop(crop, crop_name)
-                print(f"[OCR] {crop_name} → {plate_text} (conf {confidence:.2f})")
-
                 plate_url = upload_to_supabase_storage(crop_path, camera_id)
-
-                # Insert + validate
-                alert_msg = insert_plate_record(camera_id, plate_text, confidence, plate_url, None)
 
                 detected_plates.append({
                     "file": crop_name,
                     "text": plate_text or "unreadable",
                     "plate_url": plate_url,
-                    "confidence": confidence,
-                    "alert": alert_msg
+                    "confidence": confidence
                 })
+
+                del crop  # free memory
 
         # Save annotated scene
         ann_name = f"{os.path.splitext(filename)[0]}_ann.jpg"
@@ -237,8 +203,11 @@ def upload_image():
         cv2.imwrite(ann_path, annotated)
         scene_url = upload_to_supabase_storage(ann_path, camera_id)
 
-        # Update violations with scene_url (if needed)
-        # (already passed as None in insert, you can enhance to update it later)
+        for dp in detected_plates:
+            insert_plate_record(camera_id, dp["text"], dp["confidence"], dp.get("plate_url"), scene_url)
+
+        del img, annotated  # free memory
+        cv2.destroyAllWindows()
 
         return jsonify({
             "status": "ok",
@@ -253,4 +222,5 @@ def upload_image():
 
 # ------------------- MAIN -------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    port = int(os.getenv("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)   # no debug=True → less memory
