@@ -8,3 +8,5 @@ pytesseract
 supabase
 requests
 streamlit
+Pillow             
+gunicorn           # For production deployment on Render
