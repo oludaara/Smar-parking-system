@@ -1,9 +1,10 @@
-
 flask
 python-dotenv
-ultralytics
-opencv-python
-pytesseract
 requests
-streamlit        
-gunicorn           
+opencv-python
+numpy
+pytesseract
+torch
+ultralytics
+supabase
+gunicorn
