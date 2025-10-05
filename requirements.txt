@@ -1,8 +1,10 @@
+
 flask
-ultralytics
-opencv-python-headless
-pytesseract
+flask-cors
 python-dotenv
+ultralytics
+opencv-python
+pytesseract
 supabase
 requests
-gunicorn
+streamlit
