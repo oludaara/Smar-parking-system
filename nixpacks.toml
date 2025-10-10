@@ -1,0 +1,5 @@
+[phases.setup]
+nixPkgs = ["libgl1"]
+
+[start]
+cmd = "gunicorn server:app"
