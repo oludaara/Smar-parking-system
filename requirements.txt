@@ -1,9 +1,10 @@
-flask
-ultralytics
-opencv-python-headless
-pytesseract
-numpy
-requests
-python-dotenv
-supabase
-gunicorn
+flask==2.3.2
+gunicorn==20.1.0
+ultralytics==8.3.204
+torch   # (leave unpinned if you already tested)
+opencv-python-headless==4.7.0.72
+numpy==1.26.0
+pytesseract==0.3.13
+requests==2.32.5
+python-dotenv==1.1.1
+supabase==2.20.0
