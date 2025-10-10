@@ -1,9 +1,9 @@
 flask
-python-dotenv
-requests
-opencv-python
-numpy
-pytesseract
 ultralytics
+opencv-python-headless
+pytesseract
+numpy
+requests
+python-dotenv
 supabase
 gunicorn
