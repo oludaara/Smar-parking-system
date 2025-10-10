@@ -1,0 +1,8 @@
+[build]
+builder = "nixpacks"
+buildCommand = "apt-get update && apt-get install -y libgl1"
+
+[deploy]
+startCommand = "gunicorn server:app"
+healthcheckPath = "/"
+restartPolicyType = "on_failure"
