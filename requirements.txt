@@ -4,7 +4,6 @@ requests
 opencv-python
 numpy
 pytesseract
-torch
 ultralytics
 supabase
 gunicorn
