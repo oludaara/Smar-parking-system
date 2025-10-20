@@ -1,5 +1,5 @@
 # Use a Python image
-FROM python:3.13
+FROM python:3.10
 
 # Install system dependencies for OpenCV, Tesseract, etc.
 RUN apt-get update && apt-get install -y \
