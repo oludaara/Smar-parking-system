@@ -1,5 +1,5 @@
-# Use a lightweight Python image
-FROM python:3.13-slim
+# Use a Python image
+FROM python:3.13
 
 # Install system dependencies for OpenCV, Tesseract, etc.
 RUN apt-get update && apt-get install -y \
