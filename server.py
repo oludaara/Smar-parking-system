@@ -17,6 +17,7 @@ from pathlib import Path
 from flask import Flask, request, jsonify
 from supabase import create_client, Client
 import mimetypes
+import traceback
 
 # ======================================================
 # INITIAL SETUP
@@ -25,6 +26,7 @@ import mimetypes
 torch.set_grad_enabled(False)  # Save memory (no gradients)
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max upload
 
 # ======================================================
 # ENVIRONMENT SETTINGS
@@ -154,34 +156,112 @@ def index():
 def test():
     return jsonify({"status": "ok", "message": "Test successful"})
 
+@app.route("/upload", methods=["GET"])
+def upload_info():
+    """Info page for /upload endpoint - responds to GET requests"""
+    return jsonify({
+        "endpoint": "/upload",
+        "method": "POST",
+        "status": "ready",
+        "message": "This endpoint accepts POST requests with image data",
+        "expected_fields": {
+            "image": "multipart/form-data file (required)",
+            "camera_id": "string (optional, defaults to CAM1)"
+        },
+        "example": "curl -X POST https://web-production-23072.up.railway.app/upload -F 'camera_id=CAM1' -F 'image=@photo.jpg'"
+    })
 
-@app.route("/upload", methods=["POST"])
+
+@app.route("/upload", methods=["GET", "POST"])
 def upload_image():
     """Main route: receives image, runs detection + OCR, uploads to Supabase"""
+    
+    # Handle GET requests - return endpoint info
+    if request.method == "GET":
+        return jsonify({
+            "endpoint": "/upload",
+            "method": "POST",
+            "status": "ready",
+            "message": "This endpoint accepts POST requests with image data",
+            "expected_fields": {
+                "image": "multipart/form-data file (required)",
+                "camera_id": "string (optional, defaults to CAM1)"
+            },
+            "example": "curl -X POST https://your-domain/upload -F 'camera_id=CAM1' -F 'image=@photo.jpg'"
+        }), 200
+    
+    # Handle POST requests - process image
+    print("\n" + "="*60)
+    print(f"[UPLOAD] New request received at {datetime.now()}")
+    print(f"Content-Type: {request.content_type}")
+    print(f"Content-Length: {request.content_length}")
+    print(f"Headers: {dict(request.headers)}")
+    print(f"Form data keys: {list(request.form.keys())}")
+    print(f"Files keys: {list(request.files.keys())}")
+    print("="*60 + "\n")
+    
     try:
+        # Get camera ID
         camera_id = request.form.get("camera_id") or request.headers.get("X-Camera-ID", "CAM1")
+        print(f"[INFO] Camera ID: {camera_id}")
 
-        # Receive image bytes
+        # Get image bytes - FIXED ORDER OF CHECKING
+        img_bytes = None
+        
+        # First, check if it's multipart form data with "image" field
         if "image" in request.files:
+            print("[INFO] Image found in request.files['image']")
             img_bytes = request.files["image"].read()
-        else:
+        # Then check for "file" field (alternative name)
+        elif "file" in request.files:
+            print("[INFO] Image found in request.files['file']")
+            img_bytes = request.files["file"].read()
+        # Finally check raw request data
+        elif request.data and len(request.data) > 0:
+            print("[INFO] Image found in request.data")
             img_bytes = request.data
+        else:
+            print("[ERROR] No image data found in request")
+            return jsonify({
+                "error": "No image data received",
+                "debug": {
+                    "content_type": request.content_type,
+                    "form_keys": list(request.form.keys()),
+                    "files_keys": list(request.files.keys()),
+                    "data_length": len(request.data) if request.data else 0
+                }
+            }), 400
 
-        if not img_bytes:
-            return jsonify({"error": "No image data received"}), 400
+        if not img_bytes or len(img_bytes) == 0:
+            print("[ERROR] Image data is empty")
+            return jsonify({"error": "Empty image data received"}), 400
+
+        print(f"[INFO] Received {len(img_bytes)} bytes of image data")
 
         # Decode image
         np_arr = np.frombuffer(img_bytes, np.uint8)
         img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        
         if img is None:
-            return jsonify({"error": "Invalid image data"}), 400
+            print("[ERROR] Failed to decode image")
+            return jsonify({
+                "error": "Invalid image data - could not decode",
+                "debug": {
+                    "bytes_received": len(img_bytes),
+                    "first_bytes": list(img_bytes[:20]) if len(img_bytes) >= 20 else list(img_bytes)
+                }
+            }), 400
+
+        print(f"[INFO] Image decoded successfully: {img.shape}")
 
         # Save raw image
         filename = datetime.now().strftime("%Y%m%d_%H%M%S.jpg")
         save_path = os.path.join(UPLOAD_DIR, filename)
         cv2.imwrite(save_path, img)
+        print(f"[INFO] Image saved to {save_path}")
 
         # Run YOLO detection
+        print("[INFO] Running YOLO detection...")
         results = model.predict(img, conf=0.5, imgsz=320, device="cpu", verbose=False)
         annotated = img.copy()
         detected_plates = []
@@ -195,6 +275,8 @@ def upload_image():
             class_ids = r.boxes.cls.cpu().numpy().astype(int)
             confs = r.boxes.conf.cpu().numpy()
 
+            print(f"[INFO] Found {len(boxes)} detections")
+
             for i, box in enumerate(boxes):
                 x1, y1, x2, y2 = map(int, box[:4])
                 confidence = float(confs[i])
@@ -204,6 +286,8 @@ def upload_image():
                 class_name = model.names[class_ids[i]] if hasattr(model, "names") else str(class_ids[i])
                 if class_name.lower() != "plate":
                     continue
+
+                print(f"[INFO] Plate detected with confidence: {confidence:.2f}")
 
                 # Draw detection box
                 cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -217,6 +301,8 @@ def upload_image():
                 cv2.imwrite(crop_path, crop)
 
                 plate_text = run_ocr_on_crop(crop, crop_name)
+                print(f"[INFO] OCR result: {plate_text or 'unreadable'}")
+                
                 plate_url = upload_to_supabase_storage(crop_path, camera_id)
 
                 detected_plates.append({
@@ -234,14 +320,17 @@ def upload_image():
 
         # If no plates were detected → still log image for debugging
         if not detected_plates:
+            print("[INFO] No plates detected in image")
             insert_plate_record(camera_id, "no_plate_detected", 0.0, None, scene_url)
             return jsonify({
                 "status": "no_plate_detected",
                 "file": filename,
-                "scene_url": scene_url
-            })
+                "scene_url": scene_url,
+                "message": "Image processed but no license plates found"
+            }), 200
 
         # Log all detections to Supabase
+        print(f"[INFO] Logging {len(detected_plates)} plates to database")
         for dp in detected_plates:
             insert_plate_record(camera_id, dp["text"], dp["confidence"], dp.get("plate_url"), scene_url)
 
@@ -249,16 +338,39 @@ def upload_image():
         del img, annotated
         cv2.destroyAllWindows()
 
+        print("[SUCCESS] Upload processed successfully\n")
+        
         return jsonify({
             "status": "ok",
             "file": filename,
             "scene_url": scene_url,
-            "plates": detected_plates
-        })
+            "plates": detected_plates,
+            "message": f"Successfully detected {len(detected_plates)} plate(s)"
+        }), 200
 
     except Exception as e:
+        error_details = traceback.format_exc()
         print(f"[ERROR] Upload failed: {e}")
-        return jsonify({"error": str(e)}), 500
+        print(f"[ERROR] Traceback:\n{error_details}")
+        
+        return jsonify({
+            "error": str(e),
+            "type": type(e).__name__,
+            "traceback": error_details if app.debug else "Enable debug mode for details"
+        }), 500
+
+
+# ======================================================
+# ERROR HANDLERS
+# ======================================================
+
+@app.errorhandler(413)
+def request_entity_too_large(error):
+    return jsonify({"error": "File too large. Maximum size is 16MB"}), 413
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({"error": "Internal server error"}), 500
 
 
 # ======================================================
@@ -266,4 +378,10 @@ def upload_image():
 # ======================================================
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    debug_mode = os.getenv("DEBUG", "False").lower() == "true"
+    print(f"\n{'='*60}")
+    print(f"Starting Smart Parking Detection Server")
+    print(f"Port: {port}")
+    print(f"Debug: {debug_mode}")
+    print(f"{'='*60}\n")
+    app.run(host="0.0.0.0", port=port, debug=debug_mode)
