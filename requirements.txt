@@ -1,8 +1,18 @@
+# --- Core Web Framework ---
 flask==3.0.3
 gunicorn==21.2.0
+
+# --- AI / ML / Computer Vision ---
 ultralytics==8.3.204
 torch>=2.2.0
 opencv-python-headless>=4.8.0
 numpy>=2.0.0
 pytesseract==0.3.13
+
+# --- Supabase + Database ---
 supabase==2.5.1
+
+# --- Utilities ---
+requests==2.32.3
+python-dotenv==1.0.1
+Pillow>=10.0.0
